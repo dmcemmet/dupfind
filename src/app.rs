@@ -16,7 +16,7 @@ use ratatui_image::{Image, picker::Picker};
 
 use crate::preview;
 use crate::scanner::{DuplicateGroups, FileInfo};
-use crate::tree::{TreeNode, build_tree};
+use crate::tree::{SortMode, TreeNode, build_tree};
 
 #[derive(Clone, Copy, PartialEq)]
 enum DialogButton {
@@ -34,29 +34,22 @@ enum DialogState {
     Error(Vec<String>),
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum SortMode {
-    Name,
-    Size,
-    Date,
-    Count,
-}
-
 pub struct App {
-    pub groups: DuplicateGroups,
-    pub root: PathBuf,
-    pub tree: TreeNode,
-    pub left_state: ListState,
-    pub right_state: ListState,
-    pub focus_right: bool,
-    pub picker: Picker,
-    pub read_only: bool,
+    groups: DuplicateGroups,
+    root: PathBuf,
+    tree: TreeNode,
+    left_state: ListState,
+    right_state: ListState,
+    focus_right: bool,
+    picker: Picker,
+    read_only: bool,
     preview_cache: Option<(PathBuf, CachedPreview)>,
     selected_for_delete: BTreeSet<PathBuf>,
     dialog: DialogState,
     sort_mode: SortMode,
     filter: String,
     filtering: bool,
+    show_preview: bool,
 }
 
 enum CachedPreview {
@@ -90,6 +83,7 @@ impl App {
             sort_mode: SortMode::Name,
             filter: String::new(),
             filtering: false,
+            show_preview: true,
         }
     }
 
@@ -128,11 +122,20 @@ impl App {
                         KeyCode::Tab => self.focus_right = !self.focus_right,
                         KeyCode::Down | KeyCode::Char('j') => self.move_down(),
                         KeyCode::Up | KeyCode::Char('k') => self.move_up(),
+                        KeyCode::Home => self.jump_top(),
+                        KeyCode::End => self.jump_bottom(),
                         KeyCode::Enter => self.toggle(),
                         KeyCode::Char(' ') => self.toggle_select(),
                         KeyCode::Char('d') if !self.read_only => self.open_delete_dialog(),
                         KeyCode::Char('a') => self.select_all_in_group(),
                         KeyCode::Char('s') => self.cycle_sort(),
+                        KeyCode::Char('p') => {
+                            self.show_preview = !self.show_preview;
+                            if !self.show_preview {
+                                self.preview_cache = None;
+                            }
+                        }
+                        KeyCode::Char('g') => self.goto_file_directory(),
                         KeyCode::Char('/') => {
                             self.filtering = true;
                         }
@@ -204,7 +207,7 @@ impl App {
                 self.right_state.select(Some(i));
             }
         } else {
-            let len = self.tree.flatten().len();
+            let len = self.tree.flatten_sorted(self.sort_mode).len();
             if len > 0 {
                 let i = self
                     .left_state
@@ -235,11 +238,37 @@ impl App {
         }
     }
 
+    fn jump_top(&mut self) {
+        if self.focus_right {
+            self.right_state.select(Some(0));
+        } else {
+            self.left_state.select(Some(0));
+            self.right_state.select(Some(0));
+            self.preview_cache = None;
+        }
+    }
+
+    fn jump_bottom(&mut self) {
+        if self.focus_right {
+            let len = self.right_items_len();
+            if len > 0 {
+                self.right_state.select(Some(len - 1));
+            }
+        } else {
+            let len = self.tree.flatten_sorted(self.sort_mode).len();
+            if len > 0 {
+                self.left_state.select(Some(len - 1));
+                self.right_state.select(Some(0));
+                self.preview_cache = None;
+            }
+        }
+    }
+
     fn toggle(&mut self) {
         if self.focus_right {
             return;
         }
-        let flat = self.tree.flatten();
+        let flat = self.tree.flatten_sorted(self.sort_mode);
         if let Some(idx) = self.left_state.selected()
             && let Some((_, node)) = flat.get(idx)
             && node.is_dir
@@ -251,7 +280,19 @@ impl App {
 
     fn toggle_select(&mut self) {
         if !self.focus_right {
-            self.toggle();
+            // Select/deselect the file under cursor in left pane
+            let flat = self.tree.flatten_sorted(self.sort_mode);
+            if let Some(idx) = self.left_state.selected()
+                && let Some((_, node)) = flat.get(idx)
+                && !node.is_dir
+            {
+                let path = node.path.clone();
+                if !self.selected_for_delete.remove(&path) {
+                    self.selected_for_delete.insert(path);
+                }
+            } else {
+                self.toggle();
+            }
             return;
         }
         let Some((sel, group_idx)) = self.selected_file() else {
@@ -277,14 +318,84 @@ impl App {
     }
 
     fn select_all_in_group(&mut self) {
+        if self.focus_right {
+            // In right pane: select all copies except the primary
+            let Some((sel, group_idx)) = self.selected_file() else {
+                return;
+            };
+            let sel_path = sel.path.clone();
+            for f in &self.groups[group_idx] {
+                if f.path != sel_path {
+                    self.selected_for_delete.insert(f.path.clone());
+                }
+            }
+        } else {
+            // In left pane: select all files in the current directory
+            let flat = self.tree.flatten_sorted(self.sort_mode);
+            let Some(idx) = self.left_state.selected() else {
+                return;
+            };
+            let Some((_, node)) = flat.get(idx) else {
+                return;
+            };
+            // Determine the parent directory
+            let parent = if node.is_dir {
+                node.path.clone()
+            } else {
+                node.path.parent().unwrap_or(&node.path).to_path_buf()
+            };
+            // Select all file nodes that are direct children of this directory
+            for (_, n) in &flat {
+                if !n.is_dir {
+                    if let Some(p) = n.path.parent() {
+                        if p == parent {
+                            self.selected_for_delete.insert(n.path.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn goto_file_directory(&mut self) {
+        if !self.focus_right {
+            return;
+        }
         let Some((sel, group_idx)) = self.selected_file() else {
             return;
         };
-        let sel_path = sel.path.clone();
-        // Mark all copies except the first (the one shown with [<<]) for deletion
-        for f in &self.groups[group_idx] {
-            if f.path != sel_path {
-                self.selected_for_delete.insert(f.path.clone());
+        let right_idx = self.right_state.selected().unwrap_or(0);
+        let target_path = if right_idx == 0 {
+            sel.path.clone()
+        } else {
+            let dupes: Vec<&FileInfo> = self.groups[group_idx]
+                .iter()
+                .filter(|f| f.path != sel.path)
+                .collect();
+            match dupes.get(right_idx - 1) {
+                Some(f) => f.path.clone(),
+                None => return,
+            }
+        };
+        // Find the target file in the tree and navigate to it
+        let flat = self.tree.flatten_sorted(self.sort_mode);
+        if let Some(pos) = flat.iter().position(|(_, n)| n.path == target_path) {
+            self.left_state.select(Some(pos));
+            self.right_state.select(Some(0));
+            self.preview_cache = None;
+            self.focus_right = false;
+        } else if let Some(parent) = target_path.parent() {
+            if let Some(_) = flat.iter().position(|(_, n)| n.path == parent) {
+                // Parent exists but is collapsed — expand it
+                self.tree.toggle_expand(parent);
+                let flat = self.tree.flatten_sorted(self.sort_mode);
+                let pos = flat.iter().position(|(_, n)| n.path == target_path)
+                    .or_else(|| flat.iter().position(|(_, n)| n.path == parent))
+                    .unwrap_or(0);
+                self.left_state.select(Some(pos));
+                self.right_state.select(Some(0));
+                self.preview_cache = None;
+                self.focus_right = false;
             }
         }
     }
@@ -361,7 +472,7 @@ impl App {
                 .collect()
         };
         self.tree = build_tree(&filtered, &self.root);
-        let flat = self.tree.flatten();
+        let flat = self.tree.flatten_sorted(self.sort_mode);
         if flat.is_empty() {
             self.left_state.select(None);
             self.right_state.select(None);
@@ -386,7 +497,7 @@ impl App {
     }
 
     fn selected_file(&self) -> Option<(&FileInfo, usize)> {
-        let flat = self.tree.flatten();
+        let flat = self.tree.flatten_sorted(self.sort_mode);
         let idx = self.left_state.selected()?;
         let (_, node) = flat.get(idx)?;
         let info = node.file_info.as_ref()?;
@@ -428,6 +539,9 @@ impl App {
     }
 
     fn ensure_preview(&mut self) {
+        if !self.show_preview {
+            return;
+        }
         let Some((sel, _)) = self.selected_file() else {
             self.preview_cache = None;
             return;
@@ -469,13 +583,40 @@ impl App {
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(outer[0]);
 
-        let right_col = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(main[1]);
+        let right_col = if self.show_preview {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(main[1])
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(100), Constraint::Length(0)])
+                .split(main[1])
+        };
 
-        // === Left pane ===
-        let flat = self.tree.flatten();
+        // Compute selected info as owned data to avoid borrow conflicts
+        let selected_info: Option<(FileInfo, usize)> = self.selected_file()
+            .map(|(info, idx)| (info.clone(), idx));
+
+        self.draw_left_pane(f, main[0]);
+        self.draw_right_pane(f, right_col[0], selected_info.as_ref());
+        if self.show_preview {
+            self.draw_preview(f, right_col[1]);
+        }
+
+        let details = self.build_details(selected_info.as_ref());
+        let details_widget = Paragraph::new(details)
+            .block(Block::default().borders(Borders::ALL).title(" Details "));
+        f.render_widget(details_widget, outer[1]);
+
+        self.draw_status_bar(f, outer[2]);
+        self.draw_dialog(f);
+    }
+
+    fn draw_left_pane(&mut self, f: &mut Frame, area: Rect) {
+        let left_width = area.width.saturating_sub(2) as usize;
+        let flat = self.tree.flatten_sorted(self.sort_mode);
         let items: Vec<ListItem> = flat
             .iter()
             .map(|(depth, node)| {
@@ -485,15 +626,31 @@ impl App {
                 } else {
                     "  "
                 };
-                let style = if node.is_dir {
+                let marked = !node.is_dir && self.selected_for_delete.contains(&node.path);
+                let prefix = if marked { "*" } else { " " };
+                let style = if marked {
+                    Style::default().fg(Color::Red)
+                } else if node.is_dir {
                     Style::default()
                         .fg(Color::Blue)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
+                let size_str = if let Some(info) = &node.file_info {
+                    format!(" [{}]", format_size(info.size))
+                } else {
+                    String::new()
+                };
+                let fixed_len = prefix.len() + indent.len() + icon.len() + size_str.len();
+                let name = if !node.is_dir && fixed_len + node.name.len() > left_width {
+                    let avail = left_width.saturating_sub(fixed_len);
+                    truncate_middle(&node.name, avail)
+                } else {
+                    node.name.clone()
+                };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{indent}{icon}{}", node.name),
+                    format!("{prefix}{indent}{icon}{name}{size_str}"),
                     style,
                 )))
             })
@@ -504,41 +661,38 @@ impl App {
         } else {
             " Duplicates ".to_string()
         };
-        let left_border_style = if !self.focus_right {
+        let border_style = if !self.focus_right {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
-        let left_list = List::new(items)
+        let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(left_title)
-                    .border_style(left_border_style),
+                    .border_style(border_style),
             )
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             );
-        f.render_stateful_widget(left_list, main[0], &mut self.left_state);
+        f.render_stateful_widget(list, area, &mut self.left_state);
+    }
 
-        // === Top-right pane: duplicate locations ===
-        let (right_items, right_title) = if let Some((sel, group_idx)) = self.selected_file() {
+    fn draw_right_pane(&mut self, f: &mut Frame, area: Rect, selected: Option<&(FileInfo, usize)>) {
+        let (items, title) = if let Some((sel, group_idx)) = selected {
             let rel_sel = sel.path.strip_prefix(&self.root).unwrap_or(&sel.path);
             let marked_sel = self.selected_for_delete.contains(&sel.path);
             let prefix = if marked_sel { "* " } else { "" };
-            let color = if marked_sel {
-                Color::Red
-            } else {
-                Color::Yellow
-            };
+            let color = if marked_sel { Color::Red } else { Color::Yellow };
             let mut items = vec![ListItem::new(Line::from(vec![
                 Span::styled(format!("{prefix}[<<] "), Style::default().fg(color)),
                 Span::styled(format!("{}", rel_sel.display()), Style::default().fg(color)),
             ]))];
             items.extend(
-                self.groups[group_idx]
+                self.groups[*group_idx]
                     .iter()
                     .filter(|f| f.path != sel.path)
                     .map(|f| {
@@ -561,63 +715,53 @@ impl App {
             (vec![], " Duplicate Locations ")
         };
 
-        let right_border_style = if self.focus_right {
+        let border_style = if self.focus_right {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
-        let right_list = List::new(right_items)
+        let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(right_title)
-                    .border_style(right_border_style),
+                    .title(title)
+                    .border_style(border_style),
             )
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             );
-        f.render_stateful_widget(right_list, right_col[0], &mut self.right_state);
+        f.render_stateful_widget(list, area, &mut self.right_state);
+    }
 
-        // === Bottom-right pane: preview ===
-        let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect) {
+        let block = Block::default().borders(Borders::ALL).title(" Preview ");
         match &self.preview_cache {
             Some((_, CachedPreview::Text(text))) => {
                 let para = Paragraph::new(text.clone())
-                    .block(preview_block)
+                    .block(block)
                     .wrap(Wrap { trim: false });
-                f.render_widget(para, right_col[1]);
+                f.render_widget(para, area);
             }
             Some((_, CachedPreview::Image(img))) => {
-                let inner = preview_block.inner(right_col[1]);
-                f.render_widget(preview_block, right_col[1]);
+                let inner = block.inner(area);
+                f.render_widget(block, area);
                 if inner.width > 0
                     && inner.height > 0
-                    && let Some(proto) = preview::make_image_protocol(&mut self.picker, img, inner)
+                    && let Some(proto) =
+                        preview::make_image_protocol(&mut self.picker, img, inner)
                 {
                     f.render_widget(Image::new(&proto), inner);
                 }
             }
             _ => {
                 let para = Paragraph::new("No preview available")
-                    .block(preview_block)
+                    .block(block)
                     .style(Style::default().fg(Color::DarkGray));
-                f.render_widget(para, right_col[1]);
+                f.render_widget(para, area);
             }
         }
-
-        // === Details pane ===
-        let details = self.build_details();
-        let details_widget = Paragraph::new(details)
-            .block(Block::default().borders(Borders::ALL).title(" Details "));
-        f.render_widget(details_widget, outer[1]);
-
-        // === Status bar ===
-        self.draw_status_bar(f, outer[2]);
-
-        // === Dialog overlay ===
-        self.draw_dialog(f);
     }
 
     fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
@@ -676,7 +820,7 @@ impl App {
         ));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("[s]Sort:{sort_label} [/]Filter [a]SelAll [Space]Sel [Tab]Pane [q]Quit"),
+            format!("[s]Sort:{sort_label} [/]Filter [a]SelAll [Space]Sel [p]Preview [g]Goto [Tab]Pane [q]Quit"),
             Style::default().fg(Color::DarkGray),
         ));
 
@@ -784,12 +928,12 @@ impl App {
         }
     }
 
-    fn build_details(&self) -> Vec<Line<'static>> {
-        let Some((sel, group_idx)) = self.selected_file() else {
+    fn build_details(&self, selected: Option<&(FileInfo, usize)>) -> Vec<Line<'static>> {
+        let Some((sel, group_idx)) = selected else {
             return vec![Line::from("Select a file to see details")];
         };
         let right_idx = self.right_state.selected().unwrap_or(0);
-        let dupes: Vec<&FileInfo> = self.groups[group_idx]
+        let dupes: Vec<&FileInfo> = self.groups[*group_idx]
             .iter()
             .filter(|f| f.path != sel.path)
             .collect();
@@ -880,6 +1024,19 @@ fn format_size(bytes: u64) -> String {
         size /= 1024.0;
     }
     format!("{size:.1} PB")
+}
+
+fn truncate_middle(s: &str, max_len: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_len || max_len < 5 {
+        return s.to_string();
+    }
+    let avail = max_len - 1; // 1 for '…'
+    let head = avail / 2;
+    let tail = avail - head;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
 }
 
 #[cfg(test)]
@@ -995,5 +1152,62 @@ mod tests {
         ];
         sort_groups(&mut groups, SortMode::Count);
         assert_eq!(groups[0].len(), 3); // most dupes first
+    }
+
+    #[test]
+    fn test_truncate_middle_short() {
+        assert_eq!(truncate_middle("hi.txt", 20), "hi.txt");
+    }
+
+    #[test]
+    fn test_truncate_middle_exact() {
+        assert_eq!(truncate_middle("12345", 5), "12345");
+    }
+
+    #[test]
+    fn test_truncate_middle_truncates() {
+        let result = truncate_middle("long_filename_here.txt", 10);
+        assert_eq!(result.chars().count(), 10);
+        assert!(result.contains('…'));
+        // Preserves start and end
+        assert!(result.starts_with("long"));
+        assert!(result.ends_with(".txt"));
+    }
+
+    #[test]
+    fn test_truncate_middle_unicode() {
+        let name = "Układ_stron_książki.pdf";
+        let result = truncate_middle(name, 12);
+        assert_eq!(result.chars().count(), 12);
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn test_truncate_middle_too_small() {
+        // max_len < 5 returns original
+        assert_eq!(truncate_middle("abcdef", 4), "abcdef");
+    }
+
+    #[test]
+    fn test_sort_groups_by_date() {
+        use std::time::{Duration, SystemTime};
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let new = SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
+        let mut groups = vec![
+            vec![FileInfo {
+                path: PathBuf::from("old.txt"),
+                size: 10,
+                created: None,
+                modified: Some(old),
+            }],
+            vec![FileInfo {
+                path: PathBuf::from("new.txt"),
+                size: 10,
+                created: None,
+                modified: Some(new),
+            }],
+        ];
+        sort_groups(&mut groups, SortMode::Date);
+        assert_eq!(groups[0][0].path, PathBuf::from("new.txt")); // newest first
     }
 }

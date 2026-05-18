@@ -9,12 +9,13 @@ A terminal-based duplicate file finder with a TUI interface. Scans directories u
 - **Resumable scans** — interrupted scans can be resumed from the last checkpoint
 - **Network-friendly** — partial hashing reads only first/last 4KB, minimizing network traffic
 - **Trash or delete** — move duplicates to a local trash folder or permanently delete
-- **File preview** — inline text preview (first 4KB) and image thumbnails in the terminal
+- **File preview** — toggleable inline text preview (first 4KB) and image thumbnails filling the preview pane
 - **Exclude patterns** — glob-based directory exclusion (e.g. `@Recycle`, `.git`)
 - **Read-only mode** — browse duplicates without any deletion capability
-- **Sorting** — sort groups by name, size, date, or count
+- **Sorting** — sort groups and tree by name, size, date, or count
 - **Filtering** — live filter to narrow down results by path
-- **Result caching** — completed scan results are cached for instant reload
+- **Result caching** — completed scan results are cached for instant reload (ESC to skip validation on slow drives)
+- **File sizes** — displayed inline with middle-truncated filenames to fit the pane
 
 ## Installation
 
@@ -52,12 +53,16 @@ dupfinder /mnt/nas --ro --exclude "@*" --exclude ".git"
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
+| `Home` | Jump to top of list |
+| `End` | Jump to bottom of list |
 | `Enter` | Expand/collapse directory |
 | `Tab` | Switch focus between tree and duplicates pane |
-| `Space` | Toggle file selection (in duplicates pane) |
-| `a` | Select all copies in current group (except the primary) |
+| `Space` | Toggle file selection (in both panes) |
+| `a` | Select all files in current directory (left pane) / all copies in group (right pane) |
 | `d` | Open delete dialog (disabled in read-only mode) |
 | `s` | Cycle sort mode (name → size → date → count) |
+| `p` | Toggle preview pane |
+| `g` | Go to selected file's directory in tree (from duplicates pane) |
 | `/` | Start filtering by path |
 | `Esc` / `q` | Quit (or cancel filter/dialog) |
 

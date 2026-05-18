@@ -1,5 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +34,7 @@ fn cache_path_for(root: &Path) -> Option<PathBuf> {
 }
 
 /// Loads cached duplicate groups for the given root directory.
+/// Shows a progress bar while validating file existence. Press ESC to skip validation.
 pub fn load(root: &Path) -> Option<DuplicateGroups> {
     let path = cache_path_for(root)?;
     let data = fs::read(&path).ok()?;
@@ -38,6 +42,34 @@ pub fn load(root: &Path) -> Option<DuplicateGroups> {
     if entry.root != root {
         return None;
     }
+    let total_files: usize = entry.groups.iter().map(|g| g.paths.len()).sum();
+    let bar = indicatif::ProgressBar::new(total_files as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("{spinner:.cyan} Validating cached files [{bar:30.cyan/dim}] {pos}/{len} (ESC to skip)")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = Arc::clone(&cancelled);
+
+    let _ = crossterm::terminal::enable_raw_mode();
+    let esc_thread = thread::spawn(move || {
+        use crossterm::event::{self, Event, KeyCode};
+        use std::time::Duration;
+        while !cancelled_clone.load(Ordering::Relaxed) {
+            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.code == KeyCode::Esc {
+                        cancelled_clone.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     let groups = entry
         .groups
         .into_iter()
@@ -45,6 +77,15 @@ pub fn load(root: &Path) -> Option<DuplicateGroups> {
             g.paths
                 .into_iter()
                 .map(|p| {
+                    bar.inc(1);
+                    if cancelled.load(Ordering::Relaxed) {
+                        return FileInfo {
+                            size: g.size,
+                            created: None,
+                            modified: None,
+                            path: p,
+                        };
+                    }
                     let meta = fs::metadata(&p).ok();
                     FileInfo {
                         path: p,
@@ -53,11 +94,16 @@ pub fn load(root: &Path) -> Option<DuplicateGroups> {
                         modified: meta.as_ref().and_then(|m| m.modified().ok()),
                     }
                 })
-                .filter(|f| f.path.exists())
+                .filter(|f| cancelled.load(Ordering::Relaxed) || f.path.exists())
                 .collect::<Vec<_>>()
         })
         .filter(|g| g.len() > 1)
         .collect();
+
+    cancelled.store(true, Ordering::Relaxed);
+    let _ = esc_thread.join();
+    let _ = crossterm::terminal::disable_raw_mode();
+    bar.finish_and_clear();
     Some(groups)
 }
 

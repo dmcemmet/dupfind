@@ -9,7 +9,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 
 const TEXT_PREVIEW_BYTES: usize = 4096;
-const THUMB_MAX_DIM: u32 = 200; // max pixels for thumbnail decode
+const THUMB_MAX_DIM: u32 = 1000; // max pixels for thumbnail decode (fills preview pane)
 
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "ico",

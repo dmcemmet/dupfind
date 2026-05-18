@@ -39,14 +39,15 @@ fn main() -> std::io::Result<()> {
     let root = cli.path.canonicalize().unwrap_or(cli.path);
 
     // Check for existing scan state (incomplete or complete)
+    eprintln!("Checking state for {}...", root.display());
     let resume_state = ScanState::load(&root);
-    // Check for cached final results
     let cached_results = cache::load(&root);
 
     let groups = if let Some(cached) = cached_results {
+        let file_count: usize = cached.iter().map(|g| g.len()).sum();
+        let group_count = cached.len();
         eprint!(
-            "Found cached results for {}. [U]se cache / [r]escan / [q]uit: ",
-            root.display()
+            "Found cached results ({group_count} groups, {file_count} files). [U]se cache / [r]escan / [q]uit: ",
         );
         std::io::stderr().flush()?;
         let mut input = String::new();
