@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::scanner::{DuplicateGroups, FileInfo};
@@ -70,12 +71,12 @@ pub fn load(root: &Path) -> Option<DuplicateGroups> {
         }
     });
 
-    let groups = entry
+    let groups: DuplicateGroups = entry
         .groups
-        .into_iter()
+        .into_par_iter()
         .map(|g| {
             g.paths
-                .into_iter()
+                .into_par_iter()
                 .map(|p| {
                     bar.inc(1);
                     if cancelled.load(Ordering::Relaxed) {
@@ -100,10 +101,17 @@ pub fn load(root: &Path) -> Option<DuplicateGroups> {
         .filter(|g| g.len() > 1)
         .collect();
 
+    let cancelled_was_set = cancelled.load(Ordering::Relaxed);
     cancelled.store(true, Ordering::Relaxed);
     let _ = esc_thread.join();
     let _ = crossterm::terminal::disable_raw_mode();
     bar.finish_and_clear();
+
+    // Save updated cache if files were removed during validation
+    if !cancelled_was_set && total_files != groups.iter().map(|g| g.len()).sum::<usize>() {
+        save(root, &groups);
+    }
+
     Some(groups)
 }
 

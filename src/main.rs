@@ -32,6 +32,14 @@ struct Cli {
     /// Exclude directories matching glob patterns (e.g. --exclude "@*" "tmp")
     #[arg(short = 'e', long = "exclude")]
     exclude: Vec<String>,
+
+    /// Minimum file size to consider (e.g. "1MB", "500KB", "1024")
+    #[arg(long = "min-size")]
+    min_size: Option<String>,
+
+    /// Dry-run: show what would be deleted without launching TUI
+    #[arg(long = "dry-run")]
+    dry_run: bool,
 }
 
 fn main() -> std::io::Result<()> {
@@ -43,7 +51,7 @@ fn main() -> std::io::Result<()> {
     let resume_state = ScanState::load(&root);
     let cached_results = cache::load(&root);
 
-    let groups = if let Some(cached) = cached_results {
+    let mut groups = if let Some(cached) = cached_results {
         let file_count: usize = cached.iter().map(|g| g.len()).sum();
         let group_count = cached.len();
         eprint!(
@@ -87,8 +95,30 @@ fn main() -> std::io::Result<()> {
     // Save final results to cache
     cache::save(&root, &groups);
 
+    // Apply min-size filter
+    if let Some(ref min_size_str) = cli.min_size {
+        let min_bytes = parse_size(min_size_str);
+        groups.retain(|g| g[0].size >= min_bytes);
+    }
+
     if groups.is_empty() {
         eprintln!("No duplicates found.");
+        return Ok(());
+    }
+
+    // Dry-run mode: print report and exit
+    if cli.dry_run {
+        let mut total_wasted: u64 = 0;
+        for (i, group) in groups.iter().enumerate() {
+            let size = group[0].size;
+            eprintln!("Group {} ({}):", i + 1, format_size_simple(size));
+            for f in group {
+                let rel = f.path.strip_prefix(&root).unwrap_or(&f.path);
+                eprintln!("  {}", rel.display());
+            }
+            total_wasted += size * (group.len() as u64 - 1);
+        }
+        eprintln!("\n{} groups, {} wasted space", groups.len(), format_size_simple(total_wasted));
         return Ok(());
     }
 
@@ -234,4 +264,32 @@ fn run_scan(
     );
 
     groups
+}
+
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim().to_uppercase();
+    let (num, mult) = if s.ends_with("GB") {
+        (&s[..s.len()-2], 1024 * 1024 * 1024)
+    } else if s.ends_with("MB") {
+        (&s[..s.len()-2], 1024 * 1024)
+    } else if s.ends_with("KB") {
+        (&s[..s.len()-2], 1024)
+    } else if s.ends_with("B") {
+        (&s[..s.len()-1], 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    num.trim().parse::<u64>().unwrap_or(0) * mult
+}
+
+fn format_size_simple(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    for unit in UNITS {
+        if size < 1024.0 {
+            return format!("{size:.1} {unit}");
+        }
+        size /= 1024.0;
+    }
+    format!("{size:.1} PB")
 }

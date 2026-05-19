@@ -1,22 +1,25 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Instant;
 
 use chrono::{DateTime, Local};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use image::DynamicImage;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use ratatui_image::{Image, picker::Picker};
 
 use crate::preview;
 use crate::scanner::{DuplicateGroups, FileInfo};
-use crate::tree::{SortMode, TreeNode, build_tree};
+use crate::tree::{SortMode, TreeNode, build_tree, build_tree_indexed, count_files, dir_total_size};
 
 #[derive(Clone, Copy, PartialEq)]
 enum DialogButton {
@@ -31,6 +34,7 @@ enum DialogState {
         scroll: ListState,
         button: DialogButton,
     },
+    ConfirmQuit,
     Error(Vec<String>),
 }
 
@@ -44,12 +48,15 @@ pub struct App {
     picker: Picker,
     read_only: bool,
     preview_cache: Option<(PathBuf, CachedPreview)>,
+    async_preview: Arc<Mutex<Option<(PathBuf, CachedPreview)>>>,
     selected_for_delete: BTreeSet<PathBuf>,
     dialog: DialogState,
     sort_mode: SortMode,
     filter: String,
     filtering: bool,
     show_preview: bool,
+    notification: Option<(String, Instant)>,
+    terminal_height: u16,
 }
 
 enum CachedPreview {
@@ -78,19 +85,43 @@ impl App {
             picker,
             read_only,
             preview_cache: None,
+            async_preview: Arc::new(Mutex::new(None)),
             selected_for_delete: BTreeSet::new(),
             dialog: DialogState::None,
             sort_mode: SortMode::Name,
             filter: String::new(),
             filtering: false,
             show_preview: true,
+            notification: None,
+            terminal_height: 24,
         }
     }
 
     pub fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stderr(), EnableMouseCapture)?;
+        let result = self.run_inner(terminal);
+        crossterm::execute!(std::io::stderr(), DisableMouseCapture)?;
+        result
+    }
+
+    fn run_inner(&mut self, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+        use std::time::Duration;
         loop {
-            terminal.draw(|f| self.draw(f))?;
-            if let Event::Key(key) = event::read()? {
+            // Check for async preview result
+            if let Ok(mut lock) = self.async_preview.try_lock() {
+                if let Some(result) = lock.take() {
+                    self.preview_cache = Some(result);
+                }
+            }
+            terminal.draw(|f| {
+                self.terminal_height = f.area().height;
+                self.draw(f);
+            })?;
+            if !event::poll(Duration::from_millis(100))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -118,12 +149,20 @@ impl App {
                 }
                 match &self.dialog {
                     DialogState::None => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if !self.selected_for_delete.is_empty() {
+                                self.dialog = DialogState::ConfirmQuit;
+                            } else {
+                                return Ok(());
+                            }
+                        }
                         KeyCode::Tab => self.focus_right = !self.focus_right,
                         KeyCode::Down | KeyCode::Char('j') => self.move_down(),
                         KeyCode::Up | KeyCode::Char('k') => self.move_up(),
                         KeyCode::Home => self.jump_top(),
                         KeyCode::End => self.jump_bottom(),
+                        KeyCode::PageDown => self.page_down(),
+                        KeyCode::PageUp => self.page_up(),
                         KeyCode::Enter => self.toggle(),
                         KeyCode::Char(' ') => self.toggle_select(),
                         KeyCode::Char('d') if !self.read_only => self.open_delete_dialog(),
@@ -136,6 +175,13 @@ impl App {
                             }
                         }
                         KeyCode::Char('g') => self.goto_file_directory(),
+                        KeyCode::Char('u') => { self.selected_for_delete.clear(); }
+                        KeyCode::Char('x') => self.keep_one_select_rest(),
+                        KeyCode::Char('i') => self.invert_selection(),
+                        KeyCode::Char('c') => self.collapse_all(),
+                        KeyCode::Char('e') => self.expand_all(),
+                        KeyCode::Char('o') => self.open_externally(),
+                        KeyCode::Char('E') => self.export_report(),
                         KeyCode::Char('/') => {
                             self.filtering = true;
                         }
@@ -188,10 +234,33 @@ impl App {
                         }
                         _ => {}
                     },
+                    DialogState::ConfirmQuit => match key.code {
+                        KeyCode::Char('y') | KeyCode::Enter => return Ok(()),
+                        _ => { self.dialog = DialogState::None; }
+                    },
                     DialogState::Error(_) => {
                         self.dialog = DialogState::None;
                     }
                 }
+                }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => self.move_down(),
+                        MouseEventKind::ScrollUp => self.move_up(),
+                        MouseEventKind::Down(_) => {
+                            let x = mouse.column;
+                            let total_w = crossterm::terminal::size().map(|(w,_)| w).unwrap_or(80);
+                            let left_w = total_w * 40 / 100;
+                            if x < left_w {
+                                self.focus_right = false;
+                            } else {
+                                self.focus_right = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -262,6 +331,149 @@ impl App {
                 self.preview_cache = None;
             }
         }
+    }
+
+    fn page_down(&mut self) {
+        let page = (self.terminal_height.saturating_sub(12) as usize).max(5);
+        if self.focus_right {
+            let len = self.right_items_len();
+            if len > 0 {
+                let i = self.right_state.selected().map_or(0, |i| (i + page).min(len - 1));
+                self.right_state.select(Some(i));
+            }
+        } else {
+            let len = self.tree.flatten_sorted(self.sort_mode).len();
+            if len > 0 {
+                let i = self.left_state.selected().map_or(0, |i| (i + page).min(len - 1));
+                self.left_state.select(Some(i));
+                self.right_state.select(Some(0));
+                self.preview_cache = None;
+            }
+        }
+    }
+
+    fn page_up(&mut self) {
+        let page = (self.terminal_height.saturating_sub(12) as usize).max(5);
+        if self.focus_right {
+            let i = self.right_state.selected().map_or(0, |i| i.saturating_sub(page));
+            self.right_state.select(Some(i));
+        } else {
+            let i = self.left_state.selected().map_or(0, |i| i.saturating_sub(page));
+            self.left_state.select(Some(i));
+            self.right_state.select(Some(0));
+            self.preview_cache = None;
+        }
+    }
+
+    fn keep_one_select_rest(&mut self) {
+        // Keep the currently highlighted file in right pane, select all others in group
+        let Some((sel, group_idx)) = self.selected_file() else { return };
+        let right_idx = self.right_state.selected().unwrap_or(0);
+        let keep_path = if self.focus_right && right_idx > 0 {
+            let dupes: Vec<PathBuf> = self.groups[group_idx]
+                .iter()
+                .filter(|f| f.path != sel.path)
+                .map(|f| f.path.clone())
+                .collect();
+            dupes.get(right_idx - 1).cloned().unwrap_or(sel.path.clone())
+        } else {
+            sel.path.clone()
+        };
+        for f in &self.groups[group_idx] {
+            if f.path != keep_path {
+                self.selected_for_delete.insert(f.path.clone());
+            }
+        }
+        // Ensure the kept one is not selected
+        self.selected_for_delete.remove(&keep_path);
+    }
+
+    fn invert_selection(&mut self) {
+        if self.focus_right {
+            // Invert in current group
+            let Some((_, group_idx)) = self.selected_file() else { return };
+            for f in &self.groups[group_idx] {
+                if self.selected_for_delete.contains(&f.path) {
+                    self.selected_for_delete.remove(&f.path);
+                } else {
+                    self.selected_for_delete.insert(f.path.clone());
+                }
+            }
+        } else {
+            // Invert in current directory
+            let flat = self.tree.flatten_sorted(self.sort_mode);
+            let Some(idx) = self.left_state.selected() else { return };
+            let Some((_, node)) = flat.get(idx) else { return };
+            let parent = if node.is_dir { node.path.clone() } else {
+                node.path.parent().unwrap_or(&node.path).to_path_buf()
+            };
+            for (_, n) in &flat {
+                if !n.is_dir {
+                    if let Some(p) = n.path.parent() {
+                        if p == parent {
+                            if self.selected_for_delete.contains(&n.path) {
+                                self.selected_for_delete.remove(&n.path);
+                            } else {
+                                self.selected_for_delete.insert(n.path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn collapse_all(&mut self) {
+        self.tree.set_all_expanded(false);
+        self.left_state.select(Some(0));
+        self.right_state.select(Some(0));
+        self.preview_cache = None;
+    }
+
+    fn expand_all(&mut self) {
+        self.tree.set_all_expanded(true);
+        self.preview_cache = None;
+    }
+
+    fn open_externally(&mut self) {
+        let path = if self.focus_right {
+            let Some((sel, group_idx)) = self.selected_file() else { return };
+            let right_idx = self.right_state.selected().unwrap_or(0);
+            if right_idx == 0 {
+                sel.path.clone()
+            } else {
+                let dupes: Vec<&FileInfo> = self.groups[group_idx]
+                    .iter().filter(|f| f.path != sel.path).collect();
+                match dupes.get(right_idx - 1) {
+                    Some(f) => f.path.clone(),
+                    None => return,
+                }
+            }
+        } else {
+            let flat = self.tree.flatten_sorted(self.sort_mode);
+            let Some(idx) = self.left_state.selected() else { return };
+            let Some((_, node)) = flat.get(idx) else { return };
+            node.path.clone()
+        };
+        let _ = std::process::Command::new("open").arg(&path).spawn();
+        self.notify(format!("Opened: {}", path.file_name().unwrap_or_default().to_string_lossy()));
+    }
+
+    fn export_report(&mut self) {
+        let path = self.root.join("dupfinder_report.csv");
+        let mut lines = vec!["Group,Size,Path".to_string()];
+        for (i, group) in self.groups.iter().enumerate() {
+            for f in group {
+                let rel = f.path.strip_prefix(&self.root).unwrap_or(&f.path);
+                lines.push(format!("{},{},{}", i + 1, f.size, rel.display()));
+            }
+        }
+        let _ = std::fs::write(&path, lines.join("\n"));
+        self.notify(format!("Exported to {}", path.display()));
+    }
+
+    fn notify(&mut self, msg: String) {
+        self.notification = Some((msg, Instant::now()));
     }
 
     fn toggle(&mut self) {
@@ -445,12 +657,32 @@ impl App {
         }
 
         // Remove trashed files from groups
+        let deleted: BTreeSet<PathBuf> = self.selected_for_delete.clone();
         for group in &mut self.groups {
-            group.retain(|f| !self.selected_for_delete.contains(&f.path));
+            group.retain(|f| !deleted.contains(&f.path));
         }
         self.groups.retain(|g| g.len() > 1);
         self.selected_for_delete.clear();
-        self.rebuild_tree();
+        crate::cache::save(&self.root, &self.groups);
+
+        // Incremental tree update: remove deleted nodes
+        for path in &deleted {
+            self.tree.remove_path(path);
+        }
+        self.tree.prune_empty_dirs();
+        let flat = self.tree.flatten_sorted(self.sort_mode);
+        if flat.is_empty() {
+            self.left_state.select(None);
+            self.right_state.select(None);
+        } else {
+            let idx = self.left_state.selected().unwrap_or(0).min(flat.len() - 1);
+            self.left_state.select(Some(idx));
+            self.right_state.select(Some(0));
+        }
+        self.preview_cache = None;
+
+        let count = deleted.len();
+        self.notify(format!("Deleted {count} file(s)"));
 
         if !errors.is_empty() {
             self.dialog = DialogState::Error(errors);
@@ -458,20 +690,20 @@ impl App {
     }
 
     fn rebuild_tree(&mut self) {
-        let filtered = if self.filter.is_empty() {
-            self.groups.clone()
+        let filtered: Vec<(usize, &Vec<FileInfo>)> = if self.filter.is_empty() {
+            self.groups.iter().enumerate().collect()
         } else {
             let f = self.filter.to_lowercase();
             self.groups
                 .iter()
-                .filter(|g| {
+                .enumerate()
+                .filter(|(_, g)| {
                     g.iter()
                         .any(|fi| fi.path.to_string_lossy().to_lowercase().contains(&f))
                 })
-                .cloned()
                 .collect()
         };
-        self.tree = build_tree(&filtered, &self.root);
+        self.tree = build_tree_indexed(&filtered, &self.root);
         let flat = self.tree.flatten_sorted(self.sort_mode);
         if flat.is_empty() {
             self.left_state.select(None);
@@ -550,20 +782,27 @@ impl App {
         if self.preview_cache.as_ref().is_some_and(|(p, _)| *p == path) {
             return;
         }
-        let cached = if preview::is_image(&path) {
-            match preview::load_image_thumbnail(&path) {
-                Some(img) => CachedPreview::Image(img),
-                None => CachedPreview::Unsupported,
+        // Launch async preview load
+        self.preview_cache = None;
+        let result = Arc::clone(&self.async_preview);
+        thread::spawn(move || {
+            let cached = if preview::is_image(&path) {
+                match preview::load_image_thumbnail(&path) {
+                    Some(img) => CachedPreview::Image(img),
+                    None => CachedPreview::Unsupported,
+                }
+            } else if preview::is_text(&path) {
+                match preview::load_text_preview(&path) {
+                    Some(text) => CachedPreview::Text(text),
+                    None => CachedPreview::Unsupported,
+                }
+            } else {
+                CachedPreview::Unsupported
+            };
+            if let Ok(mut lock) = result.lock() {
+                *lock = Some((path, cached));
             }
-        } else if preview::is_text(&path) {
-            match preview::load_text_preview(&path) {
-                Some(text) => CachedPreview::Text(text),
-                None => CachedPreview::Unsupported,
-            }
-        } else {
-            CachedPreview::Unsupported
-        };
-        self.preview_cache = Some((path, cached));
+        });
     }
 
     fn draw(&mut self, f: &mut Frame) {
@@ -574,7 +813,7 @@ impl App {
             .constraints([
                 Constraint::Min(5),
                 Constraint::Length(6),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ])
             .split(f.area());
 
@@ -637,7 +876,11 @@ impl App {
                 } else {
                     Style::default()
                 };
-                let size_str = if let Some(info) = &node.file_info {
+                let size_str = if node.is_dir {
+                    let count = count_files(node);
+                    let size = dir_total_size(node);
+                    format!(" [{}, {}]", count, format_size(size))
+                } else if let Some(info) = &node.file_info {
                     format!(" [{}]", format_size(info.size))
                 } else {
                     String::new()
@@ -679,6 +922,14 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             );
         f.render_stateful_widget(list, area, &mut self.left_state);
+
+        let mut scrollbar_state = ScrollbarState::new(flat.len())
+            .position(self.left_state.selected().unwrap_or(0));
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut scrollbar_state,
+        );
     }
 
     fn draw_right_pane(&mut self, f: &mut Frame, area: Rect, selected: Option<&(FileInfo, usize)>) {
@@ -715,6 +966,7 @@ impl App {
             (vec![], " Duplicate Locations ")
         };
 
+        let item_count = items.len();
         let border_style = if self.focus_right {
             Style::default().fg(Color::Cyan)
         } else {
@@ -733,6 +985,14 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             );
         f.render_stateful_widget(list, area, &mut self.right_state);
+
+        let mut scrollbar_state = ScrollbarState::new(item_count)
+            .position(self.right_state.selected().unwrap_or(0));
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut scrollbar_state,
+        );
     }
 
     fn draw_preview(&mut self, f: &mut Frame, area: Rect) {
@@ -764,11 +1024,21 @@ impl App {
         }
     }
 
-    fn draw_status_bar(&self, f: &mut Frame, area: Rect) {
+    fn draw_status_bar(&mut self, f: &mut Frame, area: Rect) {
+        // Expire notification after 3 seconds
+        if let Some((_, time)) = &self.notification {
+            if time.elapsed().as_secs() >= 3 {
+                self.notification = None;
+            }
+        }
         let sel_count = self.selected_for_delete.len();
         let dup_count = self.total_duplicate_count();
         let groups_count = self.groups.len();
         let (total_size, wasted_size) = self.size_stats();
+        let sel_size: u64 = self.selected_for_delete.iter()
+            .filter_map(|p| self.groups.iter().flatten().find(|f| &f.path == p))
+            .map(|f| f.size)
+            .sum();
         let sort_label = match self.sort_mode {
             SortMode::Name => "name",
             SortMode::Size => "size",
@@ -782,23 +1052,24 @@ impl App {
             ""
         };
 
-        let mut spans = vec![
+        // Line 1: stats
+        let mut line1 = vec![
             Span::styled(
                 format!(" {groups_count} groups, {dup_count} dupes"),
                 Style::default().fg(Color::White),
             ),
             Span::raw("  "),
             Span::styled(
-                format!(
-                    "Total:{} Wasted:{}",
-                    format_size(total_size),
-                    format_size(wasted_size)
-                ),
+                format!("Total:{} Wasted:{}", format_size(total_size), format_size(wasted_size)),
                 Style::default().fg(Color::Magenta),
             ),
             Span::raw("  "),
             Span::styled(
-                format!("{sel_count} sel"),
+                if sel_count > 0 {
+                    format!("{sel_count} sel ({})", format_size(sel_size))
+                } else {
+                    format!("{sel_count} sel")
+                },
                 if sel_count > 0 {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                 } else {
@@ -807,25 +1078,31 @@ impl App {
             ),
         ];
         if !warn.is_empty() {
-            spans.push(Span::styled(
-                warn,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            line1.push(Span::styled(warn, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
         }
-        spans.push(Span::styled(
-            ro_indicator,
-            Style::default().fg(Color::Yellow),
-        ));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("[s]Sort:{sort_label} [/]Filter [a]SelAll [Space]Sel [p]Preview [g]Goto [Tab]Pane [q]Quit"),
+        line1.push(Span::styled(ro_indicator, Style::default().fg(Color::Yellow)));
+        line1.push(Span::styled(
+            format!("  Sort:{sort_label}"),
             Style::default().fg(Color::DarkGray),
         ));
 
+        // Line 2: context-aware keybind hints
+        let hints = if self.focus_right {
+            " [Space]Sel [x]KeepOne [a]SelAll [i]Invert [g]Goto [d]Del [o]Open [Tab]Pane [/]Filter [p]Preview [q]Quit"
+        } else {
+            " [Space]Sel [a]SelDir [x]KeepOne [i]Invert [u]Desel [c]Collapse [e]Expand [s]Sort [d]Del [o]Open [E]Export [Tab]Pane [/]Filter [p]Preview [q]Quit"
+        };
+        let line2 = vec![Span::styled(hints, Style::default().fg(Color::DarkGray))];
+
+        // Override line1 with notification if active
+        let line1_final = if let Some((msg, _)) = &self.notification {
+            Line::from(Span::styled(format!(" ✓ {msg}"), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
+        } else {
+            Line::from(line1)
+        };
+        let text = vec![line1_final, Line::from(line2)];
         f.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black)),
+            Paragraph::new(text).style(Style::default().bg(Color::Black)),
             area,
         );
     }
@@ -925,6 +1202,27 @@ impl App {
                 );
                 f.render_widget(para, area);
             }
+            DialogState::ConfirmQuit => {
+                let area = centered_rect(50, 20, f.area());
+                f.render_widget(Clear, area);
+                let sel_count = self.selected_for_delete.len();
+                let text = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("  {sel_count} file(s) selected but not deleted."),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(""),
+                    Line::from("  Quit anyway? [y]es / [any key] cancel"),
+                ];
+                let para = Paragraph::new(text).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Confirm Quit ")
+                        .border_style(Style::default().fg(Color::Yellow)),
+                );
+                f.render_widget(para, area);
+            }
         }
     }
 
@@ -993,8 +1291,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn format_meta(info: &FileInfo) -> Line<'static> {
     let size = format_size(info.size);
+    let meta = if info.created.is_none() || info.modified.is_none() {
+        std::fs::metadata(&info.path).ok()
+    } else {
+        None
+    };
     let created = info
         .created
+        .or_else(|| meta.as_ref().and_then(|m| m.created().ok()))
         .map(|t| {
             DateTime::<Local>::from(t)
                 .format("%Y-%m-%d %H:%M:%S")
@@ -1003,6 +1307,7 @@ fn format_meta(info: &FileInfo) -> Line<'static> {
         .unwrap_or_else(|| "N/A".into());
     let modified = info
         .modified
+        .or_else(|| meta.as_ref().and_then(|m| m.modified().ok()))
         .map(|t| {
             DateTime::<Local>::from(t)
                 .format("%Y-%m-%d %H:%M:%S")

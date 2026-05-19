@@ -55,16 +55,24 @@ dupfinder /mnt/nas --ro --exclude "@*" --exclude ".git"
 | `k` / `↑` | Move up |
 | `Home` | Jump to top of list |
 | `End` | Jump to bottom of list |
+| `PgUp` / `PgDn` | Page up / page down |
 | `Enter` | Expand/collapse directory |
 | `Tab` | Switch focus between tree and duplicates pane |
 | `Space` | Toggle file selection (in both panes) |
 | `a` | Select all files in current directory (left pane) / all copies in group (right pane) |
+| `x` | Keep highlighted file, select all other copies for deletion |
+| `i` | Invert selection in current directory (left) / group (right) |
+| `u` | Deselect all |
 | `d` | Open delete dialog (disabled in read-only mode) |
 | `s` | Cycle sort mode (name → size → date → count) |
+| `c` | Collapse all directories |
+| `e` | Expand all directories |
 | `p` | Toggle preview pane |
 | `g` | Go to selected file's directory in tree (from duplicates pane) |
+| `o` | Open selected file with system default application |
+| `E` | Export duplicate report to CSV |
 | `/` | Start filtering by path |
-| `Esc` / `q` | Quit (or cancel filter/dialog) |
+| `Esc` / `q` | Quit (confirms if files are selected) |
 
 In the delete dialog:
 

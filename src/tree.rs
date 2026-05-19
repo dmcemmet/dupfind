@@ -117,12 +117,48 @@ impl TreeNode {
             child.toggle_expand(path);
         }
     }
+
+    pub fn set_all_expanded(&mut self, expanded: bool) {
+        if self.is_dir {
+            self.expanded = expanded;
+        }
+        for child in self.children.values_mut() {
+            child.set_all_expanded(expanded);
+        }
+    }
+
+    pub fn remove_path(&mut self, path: &Path) {
+        self.children.retain(|_, child| child.path != *path);
+        for child in self.children.values_mut() {
+            child.remove_path(path);
+        }
+    }
+
+    pub fn prune_empty_dirs(&mut self) {
+        for child in self.children.values_mut() {
+            child.prune_empty_dirs();
+        }
+        self.children.retain(|_, child| !child.is_dir || !child.children.is_empty());
+    }
 }
 
 /// Build a tree containing only files that have duplicates.
 pub fn build_tree(groups: &[Vec<FileInfo>], root: &Path) -> TreeNode {
     let mut tree = TreeNode::new_dir("", root.to_path_buf());
     for (group_idx, group) in groups.iter().enumerate() {
+        for info in group {
+            if let Ok(rel) = info.path.strip_prefix(root) {
+                tree.insert_file(rel, info.clone(), group_idx);
+            }
+        }
+    }
+    tree
+}
+
+/// Build a tree with explicit group indices (for filtered views).
+pub fn build_tree_indexed(groups: &[(usize, &Vec<FileInfo>)], root: &Path) -> TreeNode {
+    let mut tree = TreeNode::new_dir("", root.to_path_buf());
+    for &(group_idx, group) in groups {
         for info in group {
             if let Ok(rel) = info.path.strip_prefix(root) {
                 tree.insert_file(rel, info.clone(), group_idx);
@@ -153,11 +189,18 @@ fn sort_nodes<'a>(nodes: &mut Vec<&'a TreeNode>, mode: SortMode) {
     }
 }
 
-fn count_files(node: &TreeNode) -> usize {
+pub fn count_files(node: &TreeNode) -> usize {
     if !node.is_dir {
         return 1;
     }
     node.children.values().map(|c| count_files(c)).sum()
+}
+
+pub fn dir_total_size(node: &TreeNode) -> u64 {
+    if !node.is_dir {
+        return node.file_info.as_ref().map_or(0, |f| f.size);
+    }
+    node.children.values().map(|c| dir_total_size(c)).sum()
 }
 
 #[cfg(test)]
