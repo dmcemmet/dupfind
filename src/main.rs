@@ -218,7 +218,7 @@ fn run_scan(
             }
             1 => {
                 if current_stage != 1 {
-                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
+                    if let Some(bar) = pb.take() { bar.finish_with_message("✓"); }
                     let total = progress.to_hash.load(Ordering::Relaxed) as u64;
                     let bar = ProgressBar::new(total);
                     bar.set_style(bar_style.clone());
@@ -235,7 +235,7 @@ fn run_scan(
             }
             2 => {
                 if current_stage != 2 {
-                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
+                    if let Some(bar) = pb.take() { bar.finish_with_message("✓"); }
                     let total = progress.to_hash.load(Ordering::Relaxed) as u64;
                     let bar = ProgressBar::new(total);
                     bar.set_style(bar_style.clone());
@@ -254,7 +254,7 @@ fn run_scan(
                 let dupes = progress.dupes_found.load(Ordering::Relaxed);
                 let groups = progress.groups_found.load(Ordering::Relaxed);
                 if current_stage != 3 {
-                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
+                    if let Some(bar) = pb.take() { bar.finish_with_message("✓"); }
                     let total = progress.to_hash.load(Ordering::Relaxed) as u64;
                     let bar = ProgressBar::new(total);
                     bar.set_style(bar_style.clone());
@@ -273,7 +273,7 @@ fn run_scan(
         thread::sleep(Duration::from_millis(50));
     }
 
-    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
+    if let Some(bar) = pb.take() { bar.finish_with_message("✓"); }
 
     let (groups, _state) = handle.join().expect("scan thread panicked");
 
