@@ -142,10 +142,8 @@ impl App {
             // Process delete steps (one per frame to show progress)
             if let DialogState::Deleting { items, current, .. } = &self.dialog {
                 if *current >= items.len() {
-                    self.finish_delete();
+                    // Done — wait for user to dismiss (handled in key events below)
                 }
-                // Don't process delete step here — do it after draw+poll
-                // so the user sees the progress
             }
 
             terminal.draw(|f| {
@@ -279,14 +277,19 @@ impl App {
                         }
                         _ => {}
                     },
-                    DialogState::Deleting { .. } => {
-                        // Cancel deletion
-                        if key.code == KeyCode::Esc {
-                            if let DialogState::Deleting { items, current, .. } = &mut self.dialog {
-                                for i in *current..items.len() {
-                                    items[i].1 = DeleteStatus::Skipped;
+                    DialogState::Deleting { items, current, .. } => {
+                        if key.code == KeyCode::Esc || key.code == KeyCode::Enter || key.code == KeyCode::Char('q') {
+                            if *current >= items.len() {
+                                // Done — dismiss
+                                self.finish_delete();
+                            } else {
+                                // Cancel remaining
+                                if let DialogState::Deleting { items, current, .. } = &mut self.dialog {
+                                    for i in *current..items.len() {
+                                        items[i].1 = DeleteStatus::Skipped;
+                                    }
+                                    *current = items.len();
                                 }
-                                *current = items.len();
                             }
                         }
                     },
@@ -1378,7 +1381,7 @@ impl App {
                 }).collect();
 
                 let done = *current >= items.len();
-                let title = if done { " Delete complete " } else { " Deleting... (ESC to cancel) " };
+                let title = if done { " Delete complete (press any key) " } else { " Deleting... (ESC to cancel) " };
                 let list = List::new(file_items)
                     .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Red)))
                     .highlight_style(Style::default().add_modifier(Modifier::BOLD));
