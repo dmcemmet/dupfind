@@ -157,9 +157,11 @@ impl App {
             if let DialogState::Deleting { items, current, .. } = &self.dialog {
                 if *current < items.len() {
                     self.process_delete_step();
-                    continue; // redraw immediately
+                    // Don't wait for event poll — redraw immediately to show progress
+                    continue;
                 }
             }
+            // Also skip poll if in DeleteError (waiting for user input is handled below)
 
             if !event::poll(Duration::from_millis(100))? {
                 continue;
