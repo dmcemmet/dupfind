@@ -127,19 +127,6 @@ impl TreeNode {
         }
     }
 
-    pub fn remove_path(&mut self, path: &Path) {
-        self.children.retain(|_, child| child.path != *path);
-        for child in self.children.values_mut() {
-            child.remove_path(path);
-        }
-    }
-
-    pub fn prune_empty_dirs(&mut self) {
-        for child in self.children.values_mut() {
-            child.prune_empty_dirs();
-        }
-        self.children.retain(|_, child| !child.is_dir || !child.children.is_empty());
-    }
 }
 
 /// Build a tree containing only files that have duplicates.

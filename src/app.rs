@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use ratatui_image::{Image, picker::Picker};
 
@@ -34,9 +34,34 @@ enum DialogState {
         scroll: ListState,
         button: DialogButton,
     },
+    Deleting {
+        items: Vec<(PathBuf, DeleteStatus)>,
+        current: usize,
+        permanent: bool,
+        scroll: ListState,
+    },
+    DeleteError {
+        items: Vec<(PathBuf, DeleteStatus)>,
+        current: usize,
+        permanent: bool,
+        error: String,
+        button: DeleteErrorButton,
+    },
     ConfirmQuit,
     Error(Vec<String>),
 }
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum DeleteStatus {
+    Pending,
+    Done,
+    Failed(String),
+    Skipped,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DeleteErrorButton { Retry, Skip, Cancel }
 
 pub struct App {
     groups: DuplicateGroups,
@@ -113,6 +138,16 @@ impl App {
                     self.preview_cache = Some(result);
                 }
             }
+
+            // Process delete steps
+            if let DialogState::Deleting { items, current, .. } = &self.dialog {
+                if *current >= items.len() {
+                    self.finish_delete();
+                } else {
+                    self.process_delete_step();
+                }
+            }
+
             terminal.draw(|f| {
                 self.terminal_height = f.area().height;
                 self.draw(f);
@@ -230,6 +265,82 @@ impl App {
                             if let DialogState::ConfirmDelete { scroll, .. } = &mut self.dialog {
                                 let i = scroll.selected().map_or(0, |i| i.saturating_sub(1));
                                 scroll.select(Some(i));
+                            }
+                        }
+                        _ => {}
+                    },
+                    DialogState::Deleting { .. } => {
+                        // Cancel deletion
+                        if key.code == KeyCode::Esc {
+                            if let DialogState::Deleting { items, current, .. } = &mut self.dialog {
+                                for i in *current..items.len() {
+                                    items[i].1 = DeleteStatus::Skipped;
+                                }
+                                *current = items.len();
+                            }
+                        }
+                    },
+                    DialogState::DeleteError { items: _, current: _, permanent: _, button: _, .. } => match key.code {
+                        KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                            if let DialogState::DeleteError { button, .. } = &mut self.dialog {
+                                *button = match button {
+                                    DeleteErrorButton::Retry => DeleteErrorButton::Skip,
+                                    DeleteErrorButton::Skip => DeleteErrorButton::Cancel,
+                                    DeleteErrorButton::Cancel => DeleteErrorButton::Retry,
+                                };
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let DialogState::DeleteError { items, current, permanent, button, .. } = &mut self.dialog {
+                                match button {
+                                    DeleteErrorButton::Retry => {
+                                        // Go back to Deleting state to retry
+                                        let items_c = items.clone();
+                                        let cur = *current;
+                                        let perm = *permanent;
+                                        self.dialog = DialogState::Deleting {
+                                            items: items_c, current: cur, permanent: perm,
+                                            scroll: ListState::default().with_selected(Some(cur)),
+                                        };
+                                    }
+                                    DeleteErrorButton::Skip => {
+                                        items[*current].1 = DeleteStatus::Failed("Skipped".to_string());
+                                        let items_c = items.clone();
+                                        let cur = *current + 1;
+                                        let perm = *permanent;
+                                        let sel = cur.min(items_c.len().saturating_sub(1));
+                                        self.dialog = DialogState::Deleting {
+                                            items: items_c, current: cur, permanent: perm,
+                                            scroll: ListState::default().with_selected(Some(sel)),
+                                        };
+                                    }
+                                    DeleteErrorButton::Cancel => {
+                                        for i in *current..items.len() {
+                                            items[i].1 = DeleteStatus::Skipped;
+                                        }
+                                        let items_c = items.clone();
+                                        let perm = *permanent;
+                                        let len = items_c.len();
+                                        self.dialog = DialogState::Deleting {
+                                            items: items_c, current: len, permanent: perm,
+                                            scroll: ListState::default(),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            if let DialogState::DeleteError { items, current, permanent, .. } = &mut self.dialog {
+                                for i in *current..items.len() {
+                                    items[i].1 = DeleteStatus::Skipped;
+                                }
+                                let items_c = items.clone();
+                                let perm = *permanent;
+                                let len = items_c.len();
+                                self.dialog = DialogState::Deleting {
+                                    items: items_c, current: len, permanent: perm,
+                                    scroll: ListState::default(),
+                                };
                             }
                         }
                         _ => {}
@@ -634,69 +745,91 @@ impl App {
 
     fn execute_delete(&mut self, permanent: bool) {
         let trash_dir = self.root.join(".dupfinder_trash");
-        let mut errors: Vec<String> = Vec::new();
 
-        if !permanent && let Err(e) = fs::create_dir_all(&trash_dir) {
-            errors.push(format!("Cannot create trash dir: {e}"));
-            self.dialog = DialogState::Error(errors);
-            return;
-        }
-
-        for path in &self.selected_for_delete {
-            if permanent {
-                if let Err(e) = fs::remove_file(path) {
-                    errors.push(format!("{}: {e}", path.display()));
-                }
-            } else if let Ok(rel) = path.strip_prefix(&self.root) {
-                let dest = trash_dir.join(rel);
-                if let Some(parent) = dest.parent()
-                    && let Err(e) = fs::create_dir_all(parent)
-                {
-                    errors.push(format!("{}: {e}", rel.display()));
-                    continue;
-                }
-                if let Err(e) = fs::rename(path, &dest)
-                    && let Err(e2) = fs::copy(path, &dest).and_then(|_| fs::remove_file(path))
-                {
-                    errors.push(format!("{}: {e}, copy fallback: {e2}", rel.display()));
-                    continue;
-                }
-            } else {
-                errors.push(format!("{}: not under root", path.display()));
+        if !permanent {
+            if let Err(e) = fs::create_dir_all(&trash_dir) {
+                self.dialog = DialogState::Error(vec![format!("Cannot create trash dir: {e}")]);
+                return;
             }
         }
 
-        // Remove trashed files from groups
-        let deleted: BTreeSet<PathBuf> = self.selected_for_delete.clone();
+        let items: Vec<(PathBuf, DeleteStatus)> = self.selected_for_delete.iter()
+            .map(|p| (p.clone(), DeleteStatus::Pending))
+            .collect();
+        self.dialog = DialogState::Deleting {
+            items,
+            current: 0,
+            permanent,
+            scroll: ListState::default().with_selected(Some(0)),
+        };
+    }
+
+    fn process_delete_step(&mut self) {
+        let (path, permanent, _current) = {
+            let DialogState::Deleting { items, current, permanent, .. } = &self.dialog else { return };
+            if *current >= items.len() { return; }
+            (items[*current].0.clone(), *permanent, *current)
+        };
+
+        let trash_dir = self.root.join(".dupfinder_trash");
+        let result = if permanent {
+            fs::remove_file(&path)
+        } else if let Ok(rel) = path.strip_prefix(&self.root) {
+            let dest = trash_dir.join(rel);
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::rename(&path, &dest).or_else(|_| fs::copy(&path, &dest).and_then(|_| fs::remove_file(&path)))
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "not under root"))
+        };
+
+        match result {
+            Ok(_) => {
+                if let DialogState::Deleting { items, current, scroll, .. } = &mut self.dialog {
+                    items[*current].1 = DeleteStatus::Done;
+                    *current += 1;
+                    scroll.select(Some((*current).min(items.len().saturating_sub(1))));
+                }
+            }
+            Err(e) => {
+                // Transition to error dialog
+                if let DialogState::Deleting { items, current, permanent, .. } = &mut self.dialog {
+                    let err = e.to_string();
+                    let items_clone = items.clone();
+                    let cur = *current;
+                    let perm = *permanent;
+                    self.dialog = DialogState::DeleteError {
+                        items: items_clone,
+                        current: cur,
+                        permanent: perm,
+                        error: err,
+                        button: DeleteErrorButton::Retry,
+                    };
+                }
+            }
+        }
+    }
+
+    fn finish_delete(&mut self) {
+        let deleted: BTreeSet<PathBuf> = if let DialogState::Deleting { items, .. } = &self.dialog {
+            items.iter()
+                .filter(|(_, s)| matches!(s, DeleteStatus::Done))
+                .map(|(p, _)| p.clone())
+                .collect()
+        } else { return };
+
+        let count = deleted.len();
         for group in &mut self.groups {
             group.retain(|f| !deleted.contains(&f.path));
         }
         self.groups.retain(|g| g.len() > 1);
         self.selected_for_delete.clear();
         crate::cache::save(&self.root, &self.groups);
-
-        // Incremental tree update: remove deleted nodes
-        for path in &deleted {
-            self.tree.remove_path(path);
-        }
-        self.tree.prune_empty_dirs();
-        let flat = self.tree.flatten_sorted(self.sort_mode);
-        if flat.is_empty() {
-            self.left_state.select(None);
-            self.right_state.select(None);
-        } else {
-            let idx = self.left_state.selected().unwrap_or(0).min(flat.len() - 1);
-            self.left_state.select(Some(idx));
-            self.right_state.select(Some(0));
-        }
+        self.rebuild_tree();
         self.preview_cache = None;
-
-        let count = deleted.len();
+        self.dialog = DialogState::None;
         self.notify(format!("Deleted {count} file(s)"));
-
-        if !errors.is_empty() {
-            self.dialog = DialogState::Error(errors);
-        }
     }
 
     fn rebuild_tree(&mut self) {
@@ -1213,6 +1346,74 @@ impl App {
                     )
                     .wrap(Wrap { trim: false });
                 f.render_widget(para, area);
+            }
+            DialogState::Deleting { items, current, scroll, .. } => {
+                let area = centered_rect(60, 50, f.area());
+                f.render_widget(Clear, area);
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .split(area);
+
+                let file_items: Vec<ListItem> = items.iter().enumerate().map(|(i, (p, status))| {
+                    let rel = p.strip_prefix(&self.root).unwrap_or(p);
+                    let (icon, style) = match status {
+                        DeleteStatus::Pending => ("○", Style::default().fg(Color::DarkGray)),
+                        DeleteStatus::Done => ("✓", Style::default().fg(Color::Green)),
+                        DeleteStatus::Failed(_) => ("✗", Style::default().fg(Color::Red)),
+                        DeleteStatus::Skipped => ("–", Style::default().fg(Color::Yellow)),
+                    };
+                    let icon = if i == *current && *current < items.len() { "►" } else { icon };
+                    ListItem::new(Line::from(Span::styled(format!("{icon} {}", rel.display()), style)))
+                }).collect();
+
+                let done = *current >= items.len();
+                let title = if done { " Delete complete " } else { " Deleting... (ESC to cancel) " };
+                let list = List::new(file_items)
+                    .block(Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(Color::Red)))
+                    .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+                f.render_stateful_widget(list, layout[0], scroll);
+
+                let ratio = if items.is_empty() { 1.0 } else { *current as f64 / items.len() as f64 };
+                let gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::ALL))
+                    .gauge_style(Style::default().fg(Color::Red))
+                    .ratio(ratio.min(1.0))
+                    .label(format!("{}/{}", current, items.len()));
+                f.render_widget(gauge, layout[1]);
+            }
+            DialogState::DeleteError { error, button, items, current, .. } => {
+                let area = centered_rect(60, 30, f.area());
+                f.render_widget(Clear, area);
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .split(area);
+
+                let rel = items[*current].0.strip_prefix(&self.root).unwrap_or(&items[*current].0);
+                let text = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(format!("  File: {}", rel.display()), Style::default().fg(Color::White))),
+                    Line::from(Span::styled(format!("  Error: {error}"), Style::default().fg(Color::Red))),
+                    Line::from(""),
+                ];
+                let para = Paragraph::new(text)
+                    .block(Block::default().borders(Borders::ALL).title(" Delete failed ").border_style(Style::default().fg(Color::Red)))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(para, layout[0]);
+
+                let retry_s = if *button == DeleteErrorButton::Retry { Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                let skip_s = if *button == DeleteErrorButton::Skip { Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Yellow) };
+                let cancel_s = if *button == DeleteErrorButton::Cancel { Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Red) };
+                let buttons = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" [ Retry ] ", retry_s),
+                    Span::raw("  "),
+                    Span::styled(" [ Skip ] ", skip_s),
+                    Span::raw("  "),
+                    Span::styled(" [ Cancel ] ", cancel_s),
+                ]);
+                f.render_widget(Paragraph::new(buttons).block(Block::default().borders(Borders::ALL)), layout[1]);
             }
             DialogState::ConfirmQuit => {
                 let area = centered_rect(50, 20, f.area());
