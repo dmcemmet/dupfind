@@ -139,19 +139,28 @@ impl App {
                 }
             }
 
-            // Process delete steps
+            // Process delete steps (one per frame to show progress)
             if let DialogState::Deleting { items, current, .. } = &self.dialog {
                 if *current >= items.len() {
                     self.finish_delete();
-                } else {
-                    self.process_delete_step();
                 }
+                // Don't process delete step here — do it after draw+poll
+                // so the user sees the progress
             }
 
             terminal.draw(|f| {
                 self.terminal_height = f.area().height;
                 self.draw(f);
             })?;
+
+            // Process one delete step after drawing (so user sees progress)
+            if let DialogState::Deleting { items, current, .. } = &self.dialog {
+                if *current < items.len() {
+                    self.process_delete_step();
+                    continue; // redraw immediately
+                }
+            }
+
             if !event::poll(Duration::from_millis(100))? {
                 continue;
             }
@@ -226,12 +235,11 @@ impl App {
                         KeyCode::Enter => {
                             if let DialogState::ConfirmDelete { button, .. } = &self.dialog {
                                 match button {
-                                    DialogButton::Trash => self.execute_delete(false),
-                                    DialogButton::DeletePermanently => self.execute_delete(true),
-                                    DialogButton::Cancel => {}
+                                    DialogButton::Trash => { self.execute_delete(false); }
+                                    DialogButton::DeletePermanently => { self.execute_delete(true); }
+                                    DialogButton::Cancel => { self.dialog = DialogState::None; }
                                 }
                             }
-                            self.dialog = DialogState::None;
                         }
                         KeyCode::Left => {
                             if let DialogState::ConfirmDelete { button, .. } = &mut self.dialog {
