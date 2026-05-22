@@ -455,8 +455,18 @@ impl App {
             let Some((_, node)) = flat.get(idx) else { return };
             node.path.clone()
         };
-        let _ = std::process::Command::new("open").arg(&path).spawn();
-        self.notify(format!("Opened: {}", path.file_name().unwrap_or_default().to_string_lossy()));
+        match std::process::Command::new("open").arg(&path).output() {
+            Ok(output) if output.status.success() => {
+                self.notify(format!("Opened: {}", path.file_name().unwrap_or_default().to_string_lossy()));
+            }
+            Ok(output) => {
+                let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                self.dialog = DialogState::Error(vec![format!("Failed to open: {err}")]);
+            }
+            Err(e) => {
+                self.dialog = DialogState::Error(vec![format!("Failed to open: {e}")]);
+            }
+        }
     }
 
     fn export_report(&mut self) {
@@ -1194,12 +1204,14 @@ impl App {
                     .iter()
                     .map(|e| Line::from(Span::styled(e.clone(), Style::default().fg(Color::Red))))
                     .collect();
-                let para = Paragraph::new(text).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Errors (press any key) ")
-                        .border_style(Style::default().fg(Color::Red)),
-                );
+                let para = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Errors (press any key) ")
+                            .border_style(Style::default().fg(Color::Red)),
+                    )
+                    .wrap(Wrap { trim: false });
                 f.render_widget(para, area);
             }
             DialogState::ConfirmQuit => {

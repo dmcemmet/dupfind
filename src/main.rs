@@ -5,7 +5,7 @@ mod scanner;
 mod tree;
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -22,8 +22,9 @@ use scanner::ScanState;
     about = "Find duplicate files with a TUI interface"
 )]
 struct Cli {
-    /// Directory to scan for duplicates
-    path: PathBuf,
+    /// Directories to scan for duplicates
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
 
     /// Read-only mode: disable all file deletion
     #[arg(long = "ro")]
@@ -40,14 +41,21 @@ struct Cli {
     /// Dry-run: show what would be deleted without launching TUI
     #[arg(long = "dry-run")]
     dry_run: bool,
+
+    /// Fast mode: skip full hash, sample N chunks from the middle (default: 1)
+    #[arg(long = "fast", num_args = 0..=1, default_missing_value = "1")]
+    fast: Option<u32>,
 }
 
 fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
-    let root = cli.path.canonicalize().unwrap_or(cli.path);
+    let roots: Vec<PathBuf> = cli.paths.iter()
+        .map(|p| p.canonicalize().unwrap_or(p.clone()))
+        .collect();
+    let root = roots[0].clone(); // primary root for cache/state/display
 
     // Check for existing scan state (incomplete or complete)
-    eprintln!("Checking state for {}...", root.display());
+    eprintln!("Checking state for {}...", roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", "));
     let resume_state = ScanState::load(&root);
     let cached_results = cache::load(&root);
 
@@ -61,7 +69,7 @@ fn main() -> std::io::Result<()> {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         match input.trim().to_lowercase().as_str() {
-            "r" | "rescan" => run_scan(&root, None, &cli.exclude),
+            "r" | "rescan" => run_scan(&roots, None, &cli.exclude, cli.fast),
             "q" | "n" => return Ok(()),
             _ => cached,
         }
@@ -73,9 +81,9 @@ fn main() -> std::io::Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             match input.trim().to_lowercase().as_str() {
-                "r" | "rescan" => run_scan(&root, None, &cli.exclude),
+                "r" | "rescan" => run_scan(&roots, None, &cli.exclude, cli.fast),
                 "q" => return Ok(()),
-                _ => run_scan(&root, Some(state), &cli.exclude),
+                _ => run_scan(&roots, Some(state), &cli.exclude, cli.fast),
             }
         } else {
             eprint!("Found incomplete scan ({summary}). [R]esume / [f]resh / [q]uit: ");
@@ -83,13 +91,13 @@ fn main() -> std::io::Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             match input.trim().to_lowercase().as_str() {
-                "f" | "fresh" => run_scan(&root, None, &cli.exclude),
+                "f" | "fresh" => run_scan(&roots, None, &cli.exclude, cli.fast),
                 "q" => return Ok(()),
-                _ => run_scan(&root, Some(state), &cli.exclude),
+                _ => run_scan(&roots, Some(state), &cli.exclude, cli.fast),
             }
         }
     } else {
-        run_scan(&root, None, &cli.exclude)
+        run_scan(&roots, None, &cli.exclude, cli.fast)
     };
 
     // Save final results to cache
@@ -113,8 +121,12 @@ fn main() -> std::io::Result<()> {
             let size = group[0].size;
             eprintln!("Group {} ({}):", i + 1, format_size_simple(size));
             for f in group {
-                let rel = f.path.strip_prefix(&root).unwrap_or(&f.path);
-                eprintln!("  {}", rel.display());
+                if roots.len() == 1 {
+                    let rel = f.path.strip_prefix(&root).unwrap_or(&f.path);
+                    eprintln!("  {}", rel.display());
+                } else {
+                    eprintln!("  {}", f.path.display());
+                }
             }
             total_wasted += size * (group.len() as u64 - 1);
         }
@@ -130,21 +142,22 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run_scan(
-    root: &Path,
+    roots: &[PathBuf],
     resume: Option<ScanState>,
     exclude: &[String],
+    fast: Option<u32>,
 ) -> scanner::DuplicateGroups {
     let progress = Arc::new(scanner::ScanProgress::new());
     let prog = Arc::clone(&progress);
-    let scan_root = root.to_path_buf();
+    let scan_roots = roots.to_vec();
     let exclude_patterns: Vec<String> = exclude.to_vec();
 
     let handle = thread::spawn(move || {
-        scanner::scan_duplicates(&scan_root, &prog, resume, &exclude_patterns)
+        scanner::scan_duplicates(&scan_roots, &prog, resume, &exclude_patterns, fast)
     });
 
     let bar_style = ProgressStyle::default_bar()
-        .template("{spinner:.cyan} {msg} [{bar:40.cyan/dim}] {pos}/{len} ({eta})")
+        .template("{spinner:.cyan} {prefix} [{bar:40.cyan/dim}] {pos}/{len} {msg}")
         .unwrap()
         .progress_chars("█▓░");
 
@@ -157,21 +170,18 @@ fn run_scan(
 
     loop {
         let stage = progress.stage.load(Ordering::Relaxed);
-        if stage >= 3 {
+        if stage >= 4 {
             break;
         }
 
         match stage {
             0 => {
-                // Walk phase
                 let dirs_total = progress.dirs_total.load(Ordering::Relaxed) as u64;
                 let dirs_done = progress.dirs_done.load(Ordering::Relaxed) as u64;
                 let files = progress.files_found.load(Ordering::Relaxed);
 
                 if dirs_done > 0 && current_stage != 0 {
-                    if let Some(bar) = pb.take() {
-                        bar.finish_and_clear();
-                    }
+                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
                     let bar = ProgressBar::new(dirs_total);
                     bar.set_style(bar_style.clone());
                     pb = Some(bar);
@@ -187,63 +197,75 @@ fn run_scan(
                 if let Some(bar) = &pb {
                     if current_stage == 254 {
                         bar.set_message(format!("Collecting directories... {dirs_total} found"));
-                        if dirs_done > 0 {
-                            // Switch to bar
-                            bar.finish_and_clear();
-                        }
+                        if dirs_done > 0 { bar.finish_and_clear(); }
                     } else {
                         bar.set_length(dirs_total);
                         bar.set_position(dirs_done);
-                        bar.set_message(format!("Walking ({files} files)"));
+                        bar.set_prefix("Walking");
+                        bar.set_message(format!("({files} files)"));
                     }
                 }
-                // Handle transition from spinner to bar
                 if current_stage == 254 && dirs_done > 0 {
-                    if let Some(b) = pb.take() {
-                        b.finish_and_clear();
-                    }
+                    if let Some(b) = pb.take() { b.finish_and_clear(); }
                     let bar = ProgressBar::new(dirs_total);
                     bar.set_style(bar_style.clone());
-                    bar.set_message(format!("Walking ({files} files)"));
+                    bar.set_prefix("Walking");
+                    bar.set_message(format!("({files} files)"));
                     bar.set_position(dirs_done);
                     pb = Some(bar);
                     current_stage = 0;
                 }
             }
             1 => {
-                // Partial hash phase
                 if current_stage != 1 {
-                    if let Some(bar) = pb.take() {
-                        bar.finish_and_clear();
-                    }
+                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
                     let total = progress.to_hash.load(Ordering::Relaxed) as u64;
                     let bar = ProgressBar::new(total);
                     bar.set_style(bar_style.clone());
-                    bar.set_message("Partial hashing");
+                    bar.set_prefix("Head hash");
                     pb = Some(bar);
                     current_stage = 1;
                 }
                 if let Some(bar) = &pb {
-                    bar.set_length(progress.to_hash.load(Ordering::Relaxed) as u64);
+                    let total = progress.to_hash.load(Ordering::Relaxed);
+                    bar.set_length(total as u64);
                     bar.set_position(progress.hashed.load(Ordering::Relaxed) as u64);
+                    bar.set_message(format!("({total} candidates)"));
                 }
             }
             2 => {
-                // Full hash phase
                 if current_stage != 2 {
-                    if let Some(bar) = pb.take() {
-                        bar.finish_and_clear();
-                    }
+                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
                     let total = progress.to_hash.load(Ordering::Relaxed) as u64;
                     let bar = ProgressBar::new(total);
                     bar.set_style(bar_style.clone());
-                    bar.set_message("Full hashing   ");
+                    bar.set_prefix("Tail hash");
                     pb = Some(bar);
                     current_stage = 2;
                 }
                 if let Some(bar) = &pb {
+                    let total = progress.to_hash.load(Ordering::Relaxed);
+                    bar.set_length(total as u64);
+                    bar.set_position(progress.hashed.load(Ordering::Relaxed) as u64);
+                    bar.set_message(format!("({total} candidates)"));
+                }
+            }
+            3 => {
+                let dupes = progress.dupes_found.load(Ordering::Relaxed);
+                let groups = progress.groups_found.load(Ordering::Relaxed);
+                if current_stage != 3 {
+                    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
+                    let total = progress.to_hash.load(Ordering::Relaxed) as u64;
+                    let bar = ProgressBar::new(total);
+                    bar.set_style(bar_style.clone());
+                    bar.set_prefix("Verifying");
+                    pb = Some(bar);
+                    current_stage = 3;
+                }
+                if let Some(bar) = &pb {
                     bar.set_length(progress.to_hash.load(Ordering::Relaxed) as u64);
                     bar.set_position(progress.hashed.load(Ordering::Relaxed) as u64);
+                    bar.set_message(format!("({groups} groups, {dupes} dupes)"));
                 }
             }
             _ => break,
@@ -251,17 +273,13 @@ fn run_scan(
         thread::sleep(Duration::from_millis(50));
     }
 
-    if let Some(bar) = pb.take() {
-        bar.finish_and_clear();
-    }
+    if let Some(bar) = pb.take() { bar.finish_and_clear(); }
 
     let (groups, _state) = handle.join().expect("scan thread panicked");
 
     let total_files = progress.files_found.load(Ordering::Relaxed);
-    eprintln!(
-        "Scanned {total_files} files. Found {} groups of duplicates.",
-        groups.len()
-    );
+    let dupe_files: usize = groups.iter().map(|g| g.len()).sum();
+    eprintln!("Scanned {total_files} files. Found {} groups ({dupe_files} duplicate files).", groups.len());
 
     groups
 }

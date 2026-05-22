@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 use walkdir::WalkDir;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
@@ -42,7 +42,7 @@ pub struct FileEntry {
 }
 
 /// Incremental scan state persisted to disk.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct ScanState {
     pub root: PathBuf,
     pub phase: ScanPhase,
@@ -118,10 +118,12 @@ pub struct ScanProgress {
     pub files_found: AtomicUsize,
     pub dirs_done: AtomicUsize,
     pub dirs_total: AtomicUsize,
-    /// 0=walk, 1=partial hash, 2=full hash, 3=done
+    /// 0=walk, 1=hashing, 2=done
     pub stage: AtomicUsize,
     pub hashed: AtomicUsize,
     pub to_hash: AtomicUsize,
+    pub dupes_found: AtomicUsize,
+    pub groups_found: AtomicUsize,
 }
 
 impl ScanProgress {
@@ -133,23 +135,24 @@ impl ScanProgress {
             stage: AtomicUsize::new(0),
             hashed: AtomicUsize::new(0),
             to_hash: AtomicUsize::new(0),
+            dupes_found: AtomicUsize::new(0),
+            groups_found: AtomicUsize::new(0),
         }
     }
 }
 
 /// 3-pass scan: walk → partial hash → full hash. Resumable at each stage.
 pub fn scan_duplicates(
-    root: &Path,
+    roots: &[PathBuf],
     progress: &ScanProgress,
     mut state: Option<ScanState>,
     exclude: &[String],
+    fast: Option<u32>,
 ) -> (DuplicateGroups, ScanState) {
     let mut s = state.take().unwrap_or_else(|| ScanState {
-        root: root.to_path_buf(),
+        root: roots[0].clone(),
         ..Default::default()
     });
-
-    let save_interval = Duration::from_secs(60);
 
     // === Pass 1: Walk directories, collect file paths + sizes ===
     if s.phase == ScanPhase::Walking {
@@ -160,28 +163,33 @@ pub fn scan_duplicates(
             .store(s.completed_dirs.len(), Ordering::Relaxed);
 
         let mut all_dirs: Vec<PathBuf> = Vec::new();
-        let walker = WalkDir::new(root).follow_links(false).into_iter();
-        for entry in walker
-            .filter_entry(|e| {
-                if !e.file_type().is_dir() {
-                    return true;
+        for root in roots {
+            let walker = WalkDir::new(root).follow_links(false).into_iter();
+            for entry in walker
+                .filter_entry(|e| {
+                    if !e.file_type().is_dir() {
+                        return true;
+                    }
+                    let name = e.file_name().to_string_lossy();
+                    !exclude.iter().any(|pat| glob_match(pat, &name))
+                })
+                .filter_map(|e| e.ok())
+            {
+                if entry.file_type().is_dir() {
+                    all_dirs.push(entry.into_path());
+                    progress.dirs_total.store(all_dirs.len(), Ordering::Relaxed);
                 }
-                let name = e.file_name().to_string_lossy();
-                !exclude.iter().any(|pat| glob_match(pat, &name))
-            })
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_dir() {
-                all_dirs.push(entry.into_path());
-                progress.dirs_total.store(all_dirs.len(), Ordering::Relaxed);
             }
         }
 
-        let mut last_save = Instant::now();
-        for dir in &all_dirs {
-            if s.completed_dirs.contains(dir) {
-                continue;
-            }
+        // Parallel directory walking — process multiple dirs simultaneously
+        let dirs_to_walk: Vec<PathBuf> = all_dirs.iter()
+            .filter(|d| !s.completed_dirs.contains(*d))
+            .cloned()
+            .collect();
+
+        let new_files: Vec<FileEntry> = dirs_to_walk.par_iter().flat_map(|dir| {
+            let mut files = Vec::new();
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
@@ -190,22 +198,19 @@ pub fn scan_duplicates(
                     if let Ok(meta) = entry.metadata() {
                         let size = meta.len();
                         if size > 0 {
-                            s.files.push(FileEntry {
-                                path: entry.path(),
-                                size,
-                            });
-                            progress.files_found.fetch_add(1, Ordering::Relaxed);
+                            files.push(FileEntry { path: entry.path(), size });
                         }
                     }
                 }
             }
-            s.completed_dirs.insert(dir.clone());
             progress.dirs_done.fetch_add(1, Ordering::Relaxed);
+            progress.files_found.fetch_add(files.len(), Ordering::Relaxed);
+            files
+        }).collect();
 
-            if last_save.elapsed() >= save_interval {
-                s.save();
-                last_save = Instant::now();
-            }
+        s.files.extend(new_files);
+        for dir in &dirs_to_walk {
+            s.completed_dirs.insert(dir.clone());
         }
 
         // Build partial hash candidates: files with non-unique sizes
@@ -222,37 +227,52 @@ pub fn scan_duplicates(
         s.save();
     }
 
-    // === Pass 2: Partial hash (first+last 4KB) on size-collision candidates ===
+    // === Pass 2: Head hash (first 4KB) — eliminates most non-duplicates ===
     if s.phase == ScanPhase::PartialHashing {
         progress.stage.store(1, Ordering::Relaxed);
-        progress
-            .to_hash
-            .store(s.partial_candidates.len(), Ordering::Relaxed);
-        progress.hashed.store(s.partial_idx, Ordering::Relaxed);
 
-        let mut last_save = Instant::now();
-        while s.partial_idx < s.partial_candidates.len() {
-            let f = &s.partial_candidates[s.partial_idx];
-            if let Some(h) = partial_hash(&f.path, f.size) {
-                s.partial_results.push((f.path.clone(), f.size, h));
-            }
-            s.partial_idx += 1;
-            progress.hashed.fetch_add(1, Ordering::Relaxed);
-
-            if last_save.elapsed() >= save_interval {
-                s.save();
-                last_save = Instant::now();
-            }
+        // Group candidates by size
+        let mut by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
+        for f in &s.partial_candidates {
+            by_size.entry(f.size).or_default().push(f.clone());
         }
+        let size_groups: Vec<Vec<FileEntry>> = by_size.into_values().filter(|g| g.len() > 1).collect();
+        let total: usize = size_groups.iter().map(|g| g.len()).sum();
+        progress.to_hash.store(total, Ordering::Relaxed);
+        progress.hashed.store(0, Ordering::Relaxed);
 
+        // Hash only first 4KB (parallel)
+        let head_collisions: Vec<FileEntry> = size_groups.into_par_iter().flat_map(|group| {
+            let mut by_head: HashMap<u64, Vec<FileEntry>> = HashMap::new();
+            for f in &group {
+                if let Some(h) = hash_head(&f.path) {
+                    by_head.entry(h).or_default().push(f.clone());
+                }
+                progress.hashed.fetch_add(1, Ordering::Relaxed);
+            }
+            by_head.into_values().filter(|g| g.len() > 1).flatten().collect::<Vec<_>>()
+        }).collect();
+
+        // === Pass 2b: Tail hash (last 4KB) — only for head-collision files ===
+        progress.stage.store(2, Ordering::Relaxed);
+        progress.to_hash.store(head_collisions.len(), Ordering::Relaxed);
+        progress.hashed.store(0, Ordering::Relaxed);
+
+        let partial_results: Vec<(PathBuf, u64, u64)> = head_collisions.into_par_iter().filter_map(|f| {
+            progress.hashed.fetch_add(1, Ordering::Relaxed);
+            let h = partial_hash(&f.path, f.size)?;
+            Some((f.path, f.size, h))
+        }).collect();
+
+        s.partial_results = partial_results;
         s.phase = ScanPhase::FullHashing;
         s.save();
     }
 
-    // === Pass 3: Full hash on partial-hash collision candidates ===
-    progress.stage.store(2, Ordering::Relaxed);
+    // === Pass 3: Full hash (or middle-sample in fast mode) on partial-hash collisions ===
+    progress.stage.store(3, Ordering::Relaxed);
 
-    // Group by (size, partial_hash)
+    // Group by (size, partial_hash) to find collision groups
     let mut by_key: HashMap<(u64, u64), Vec<(PathBuf, u64)>> = HashMap::new();
     for (path, size, ph) in &s.partial_results {
         by_key
@@ -263,11 +283,7 @@ pub fn scan_duplicates(
     let full_candidates: Vec<Vec<(PathBuf, u64)>> =
         by_key.into_values().filter(|g| g.len() > 1).collect();
 
-    let full_count: usize = full_candidates
-        .iter()
-        .filter(|g| g[0].1 > PARTIAL_HASH_SIZE * 2)
-        .map(|g| g.len())
-        .sum();
+    let full_count: usize = full_candidates.iter().map(|g| g.len()).sum();
     progress.hashed.store(0, Ordering::Relaxed);
     progress.to_hash.store(full_count, Ordering::Relaxed);
 
@@ -276,17 +292,27 @@ pub fn scan_duplicates(
         .flat_map(|group| {
             let size = group[0].1;
             if size <= PARTIAL_HASH_SIZE * 2 {
-                // Partial hash == full hash for small files
-                return vec![
-                    group
-                        .into_iter()
-                        .map(|(p, sz)| make_file_info(p, sz))
-                        .collect(),
-                ];
+                // Partial hash covers entire file — already confirmed duplicates
+                let g: Vec<FileInfo> = group
+                    .into_iter()
+                    .map(|(p, sz)| {
+                        progress.hashed.fetch_add(1, Ordering::Relaxed);
+                        make_file_info(p, sz)
+                    })
+                    .collect();
+                progress.dupes_found.fetch_add(g.len(), Ordering::Relaxed);
+                progress.groups_found.fetch_add(1, Ordering::Relaxed);
+                return vec![g];
             }
+            // Full hash or middle-sample depending on mode
             let mut by_hash: HashMap<u64, Vec<FileInfo>> = HashMap::new();
             for (path, sz) in &group {
-                if let Some(h) = full_hash(path) {
+                let h = if let Some(samples) = fast {
+                    hash_middle(path, *sz, samples)
+                } else {
+                    full_hash(path)
+                };
+                if let Some(h) = h {
                     by_hash
                         .entry(h)
                         .or_default()
@@ -294,16 +320,21 @@ pub fn scan_duplicates(
                 }
                 progress.hashed.fetch_add(1, Ordering::Relaxed);
             }
-            by_hash
+            let results: Vec<Vec<FileInfo>> = by_hash
                 .into_values()
                 .filter(|g| g.len() > 1)
-                .collect::<Vec<_>>()
+                .collect();
+            for g in &results {
+                progress.dupes_found.fetch_add(g.len(), Ordering::Relaxed);
+                progress.groups_found.fetch_add(1, Ordering::Relaxed);
+            }
+            results
         })
         .collect();
 
     s.phase = ScanPhase::Done;
     s.save();
-    progress.stage.store(3, Ordering::Relaxed);
+    progress.stage.store(4, Ordering::Relaxed);
     (groups, s)
 }
 
@@ -315,6 +346,51 @@ fn make_file_info(path: PathBuf, size: u64) -> FileInfo {
         created: meta.as_ref().and_then(|m| m.created().ok()),
         modified: meta.as_ref().and_then(|m| m.modified().ok()),
     }
+}
+
+fn hash_head(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut buf = vec![0u8; PARTIAL_HASH_SIZE as usize];
+    let n = file.read(&mut buf).ok()?;
+    Some(xxh3_64(&buf[..n]))
+}
+
+/// Hash head (4KB) + N evenly-distributed middle samples (4KB each) + tail (4KB)
+/// Caps N to the number of non-overlapping 4KB chunks that fit in the middle region.
+fn hash_middle(path: &Path, size: u64, requested_samples: u32) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let mut data = Vec::new();
+
+    // Head
+    let mut buf = vec![0u8; PARTIAL_HASH_SIZE as usize];
+    let n = file.read(&mut buf).ok()?;
+    data.extend_from_slice(&buf[..n]);
+
+    // Middle samples
+    if size > PARTIAL_HASH_SIZE * 2 {
+        let middle_region = size - PARTIAL_HASH_SIZE * 2; // bytes between head and tail
+        let max_samples = (middle_region / PARTIAL_HASH_SIZE) as u32; // how many 4KB chunks fit
+        let samples = requested_samples.min(max_samples).max(1);
+
+        let step = middle_region / (samples as u64 + 1); // distribute evenly
+        for i in 1..=samples {
+            let offset = PARTIAL_HASH_SIZE + step * i as u64;
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            let mut mid = vec![0u8; PARTIAL_HASH_SIZE as usize];
+            let n = file.read(&mut mid).ok()?;
+            data.extend_from_slice(&mid[..n]);
+        }
+    }
+
+    // Tail
+    if size > PARTIAL_HASH_SIZE {
+        file.seek(SeekFrom::End(-(PARTIAL_HASH_SIZE as i64))).ok()?;
+        let mut tail = vec![0u8; PARTIAL_HASH_SIZE as usize];
+        let n = file.read(&mut tail).ok()?;
+        data.extend_from_slice(&tail[..n]);
+    }
+
+    Some(xxh3_64(&data))
 }
 
 fn partial_hash(path: &Path, size: u64) -> Option<u64> {
@@ -341,9 +417,7 @@ fn full_hash(path: &Path) -> Option<u64> {
     let mut hasher = Xxh3::new();
     loop {
         let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
+        if n == 0 { break; }
         hasher.update(&buf[..n]);
     }
     Some(hasher.digest())
@@ -386,7 +460,7 @@ mod tests {
 
     fn test_scan(path: &Path) -> DuplicateGroups {
         let progress = ScanProgress::new();
-        let (groups, _) = scan_duplicates(path, &progress, None, &[]);
+        let (groups, _) = scan_duplicates(&[path.to_path_buf()], &progress, None, &[], None);
         groups
     }
 
@@ -504,11 +578,11 @@ mod tests {
             .unwrap();
 
         let progress = ScanProgress::new();
-        let (g1, state) = scan_duplicates(dir.path(), &progress, None, &[]);
+        let (g1, state) = scan_duplicates(&[dir.path().to_path_buf()], &progress, None, &[], None);
 
         // Resume with completed state — should skip walk and partial, just do full hash
         let progress2 = ScanProgress::new();
-        let (g2, _) = scan_duplicates(dir.path(), &progress2, Some(state), &[]);
+        let (g2, _) = scan_duplicates(&[dir.path().to_path_buf()], &progress2, Some(state), &[], None);
 
         assert_eq!(g1.len(), g2.len());
     }
@@ -530,7 +604,7 @@ mod tests {
 
         let groups = {
             let progress = ScanProgress::new();
-            let (g, _) = scan_duplicates(dir.path(), &progress, None, &["@*".to_string()]);
+            let (g, _) = scan_duplicates(&[dir.path().to_path_buf()], &progress, None, &["@*".to_string()], None);
             g
         };
         // Only one file found (the other is in excluded dir), so no duplicates
@@ -651,7 +725,7 @@ mod tests {
             .unwrap();
 
         let progress = ScanProgress::new();
-        let (_, state) = scan_duplicates(dir.path(), &progress, None, &[]);
+        let (_, state) = scan_duplicates(&[dir.path().to_path_buf()], &progress, None, &[], None);
         assert_eq!(state.phase, ScanPhase::Done);
         assert!(state.is_done());
     }
