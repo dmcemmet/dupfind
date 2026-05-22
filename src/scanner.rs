@@ -241,6 +241,19 @@ pub fn scan_duplicates(
         progress.to_hash.store(total, Ordering::Relaxed);
         progress.hashed.store(0, Ordering::Relaxed);
 
+        // Prefetch: trigger OS readahead for all candidate files
+        let prefetch_paths: Vec<PathBuf> = size_groups.iter()
+            .flat_map(|g| g.iter().map(|f| f.path.clone()))
+            .collect();
+        let _prefetch = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            for path in prefetch_paths {
+                if let Ok(mut f) = File::open(&path) {
+                    let _ = f.read(&mut buf);
+                }
+            }
+        });
+
         // Hash only first 4KB (parallel)
         let head_collisions: Vec<FileEntry> = size_groups.into_par_iter().flat_map(|group| {
             let mut by_head: HashMap<u64, Vec<FileEntry>> = HashMap::new();
@@ -286,6 +299,33 @@ pub fn scan_duplicates(
     let full_count: usize = full_candidates.iter().map(|g| g.len()).sum();
     progress.hashed.store(0, Ordering::Relaxed);
     progress.to_hash.store(full_count, Ordering::Relaxed);
+
+    // Prefetch: collect all file paths that need full/middle hashing
+    // and pre-read them in a background thread into a cache
+    let files_to_hash: Vec<(PathBuf, u64)> = full_candidates.iter()
+        .filter(|g| g[0].1 > PARTIAL_HASH_SIZE * 2)
+        .flat_map(|g| g.iter().cloned())
+        .collect();
+
+    // Spawn prefetch thread that reads files ahead into OS page cache
+    let prefetch_paths: Vec<PathBuf> = files_to_hash.iter().map(|(p, _)| p.clone()).collect();
+    let _prefetch = std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        for path in prefetch_paths {
+            // Just open and read a bit to trigger OS readahead/caching
+            if let Ok(mut f) = File::open(&path) {
+                let _ = f.read(&mut buf);
+                // For large files, also touch the middle and end
+                let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
+                if size > 65536 {
+                    let _ = f.seek(SeekFrom::Start(size / 2));
+                    let _ = f.read(&mut buf);
+                    let _ = f.seek(SeekFrom::End(-65536));
+                    let _ = f.read(&mut buf);
+                }
+            }
+        }
+    });
 
     let groups: DuplicateGroups = full_candidates
         .into_par_iter()
